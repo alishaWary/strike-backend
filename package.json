@@ -1,6 +1,6 @@
 {
   "name": "strike-terminal-backend",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Proxy between the Strike Terminal mobile UI and Dhan's v2 trading API",
   "main": "server.js",
   "scripts": {
@@ -10,6 +10,7 @@
   "dependencies": {
     "express": "^4.19.2",
     "cors": "^2.8.5",
-    "csv-parse": "^5.5.6"
+    "csv-parse": "^5.5.6",
+    "undici": "^6.19.8"
   }
 }
