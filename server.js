@@ -2,101 +2,23 @@
  * Strike Terminal — Dhan order/data proxy
  * ----------------------------------------
  * Sits between your phone UI and Dhan's v2 API. Holds your access token
- * and (once you buy it) the whitelisted static IP that Dhan requires for
- * order placement. Never ship DHAN_ACCESS_TOKEN to the browser.
- *
- * Endpoints:
- *   GET  /api/expiries?index=NIFTY|SENSEX
- *   GET  /api/live?index=NIFTY&expiry=2026-09-30&strike=24850&type=CE
- *   POST /api/order        { index, expiry, strike, type, transactionType, quantity, orderType, price, triggerPrice }
- *
- * Env vars (set these in Render/Railway's dashboard, not in code):
- *   DHAN_CLIENT_ID
- *   DHAN_ACCESS_TOKEN
- *   ALLOWED_ORIGIN     (optional — restrict CORS to your frontend's URL)
- *
- * Memory note: Dhan's /instrument/{exchange} endpoint returns EVERY listed
- * contract on that exchange (tens of thousands of rows) — too big to hold
- * fully in memory on a small server. loadFilteredInstruments() streams the
- * CSV and keeps only rows for the index you asked about, instead of
- * parsing/storing the whole file.
- */
-
-const express = require('express');
-const cors = require('cors');
-const { parse } = require('csv-parse');
-const { Readable } = require('stream');
-
-const app = express();
-app.use(express.json());
-app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
-
-const BASE = 'https://api.dhan.co/v2';
-const HEADERS = () => ({
-  'Content-Type': 'application/json',
-  'Accept': 'application/json',
-  'access-token': process.env.DHAN_ACCESS_TOKEN,
-  'client-id': process.env.DHAN_CLIENT_ID
-});
-
-// NIFTY trades options on NSE, SENSEX trades options on BSE — different
-// exchange segments, different instrument lists.
-const UNDERLYING = {
-  NIFTY:  { securityId: 13, segment: 'IDX_I', exchange: 'NSE_FNO' },
-  SENSEX: { securityId: 51, segment: 'IDX_I', exchange: 'BSE_FNO' }
-};
-
-// Cache is keyed per INDEX (not per whole exchange) and holds only the
-// handful of rows that matched — a few hundred KB at most, not the
-// multi-thousand-row full exchange file.
-const filteredCache = {}; // { NIFTY: {rows, cols, fetchedAt}, SENSEX: {...} }
-
-function findCol(row, ...hints) {
-  const keys = Object.keys(row);
-  for (const hint of hints) {
-    const hit = keys.find(k => k.toUpperCase().includes(hint));
-    if (hit) return hit;
-  }
-  return null;
-}
-
-async function loadFilteredInstruments(indexName) {
-  const ONE_DAY = 24 * 60 * 60 * 1000;
-  const cached = filteredCache[indexName];
-  if (cached && Date.now() - cached.fetchedAt < ONE_DAY) return cached;
-
-  const underlying = UNDERLYING[indexName];
-  const res = await fetch(`${BASE}/instrument/${underlying.exchange}`, {
-    headers: { 'access-token': process.env.DHAN_ACCESS_TOKEN }
-  });
-  if (!res.ok) throw new Error(`Instrument list fetch failed for ${underlying.exchange}: ${res.status}`);
-  if (!res.body) throw new Error('No response body from Dhan instrument endpoint');
-
-  const nodeStream = Readable.fromWeb(res.body);
-  const parser = nodeStream.pipe(parse({ columns: true, skip_empty_lines: true }));
-
-  let cols = null;
-  const rows = [];
-/**
- * Strike Terminal — Dhan order/data proxy
- * ----------------------------------------
- * Sits between your phone UI and Dhan's v2 API. Holds your access token
- * and (once you buy it) the whitelisted static IP that Dhan requires for
- * order placement. Never ship DHAN_ACCESS_TOKEN to the browser.
+ * and routes ORDER PLACEMENT through a static-IP proxy (from a service like
+ * StaticIP.in), since Dhan requires orders to originate from a whitelisted
+ * static IP. Quotes/charts/expiries don't need this and keep using Render's
+ * normal connection.
  *
  * Endpoints:
  *   GET  /api/expiries?index=NIFTY|SENSEX
  *   GET  /api/live?index=NIFTY&expiry=2026-09-30&strike=24850&type=CE
  *   POST /api/order   { index, expiry, strike, type, transactionType, quantity, price, stopLossPrice }
  *
- * /api/order places a Dhan Super Order with productType "CO" (Cover
- * Order) — this bundles your entry with a real stop-loss leg placed on the
- * exchange, instead of a plain single order with no protection. No target
- * leg is sent, matching "entry + stop-loss only."
- *
- * Env vars (set these in Render/Railway's dashboard, not in code):
+ * Env vars (set these in Render's dashboard, not in code):
  *   DHAN_CLIENT_ID
  *   DHAN_ACCESS_TOKEN
+ *   PROXY_URL          — from your static IP service, format:
+ *                        http://username:password@proxyhost:port
+ *                        Leave unset and everything still works EXCEPT
+ *                        order placement, which needs the static IP.
  *   ALLOWED_ORIGIN     (optional — restrict CORS to your frontend's URL)
  */
 
@@ -104,6 +26,7 @@ const express = require('express');
 const cors = require('cors');
 const { parse } = require('csv-parse');
 const { Readable } = require('stream');
+const { fetch: undiciFetch, ProxyAgent } = require('undici');
 
 const app = express();
 app.use(express.json());
@@ -116,6 +39,18 @@ const HEADERS = () => ({
   'access-token': process.env.DHAN_ACCESS_TOKEN,
   'client-id': process.env.DHAN_CLIENT_ID
 });
+
+// Only order placement needs the static IP — build the proxy dispatcher
+// once, and use it only for that call. If PROXY_URL isn't set yet, this
+// stays null and order calls just go out normally (which Dhan will reject
+// until you have a static IP whitelisted — everything else still works).
+const proxyAgent = process.env.PROXY_URL ? new ProxyAgent(process.env.PROXY_URL) : null;
+
+async function dhanFetch(url, options, useProxy) {
+  const opts = { ...options };
+  if (useProxy && proxyAgent) opts.dispatcher = proxyAgent;
+  return undiciFetch(url, opts);
+}
 
 const UNDERLYING = {
   NIFTY:  { securityId: 13, segment: 'IDX_I', exchange: 'NSE_FNO' },
@@ -139,9 +74,9 @@ async function loadFilteredInstruments(indexName) {
   if (cached && Date.now() - cached.fetchedAt < ONE_DAY) return cached;
 
   const underlying = UNDERLYING[indexName];
-  const res = await fetch(`${BASE}/instrument/${underlying.exchange}`, {
+  const res = await dhanFetch(`${BASE}/instrument/${underlying.exchange}`, {
     headers: { 'access-token': process.env.DHAN_ACCESS_TOKEN }
-  });
+  }, false);
   if (!res.ok) throw new Error(`Instrument list fetch failed for ${underlying.exchange}: ${res.status}`);
   if (!res.body) throw new Error('No response body from Dhan instrument endpoint');
 
@@ -198,11 +133,11 @@ app.get('/api/expiries', async (req, res) => {
   try {
     const idx = UNDERLYING[req.query.index];
     if (!idx) return res.status(400).json({ error: 'index must be NIFTY or SENSEX' });
-    const r = await fetch(`${BASE}/optionchain/expirylist`, {
+    const r = await dhanFetch(`${BASE}/optionchain/expirylist`, {
       method: 'POST',
       headers: HEADERS(),
       body: JSON.stringify({ UnderlyingScrip: idx.securityId, UnderlyingSeg: idx.segment })
-    });
+    }, false);
     const data = await r.json();
     res.status(r.status).json(data);
   } catch (e) {
@@ -219,12 +154,12 @@ app.get('/api/live', async (req, res) => {
     const { securityId, exchange } = await resolveSecurityId(index, expiry, strike, type);
 
     const [ohlcRes, candleRes] = await Promise.all([
-      fetch(`${BASE}/marketfeed/ohlc`, {
+      dhanFetch(`${BASE}/marketfeed/ohlc`, {
         method: 'POST',
         headers: HEADERS(),
         body: JSON.stringify({ [exchange]: [Number(securityId)] })
-      }),
-      fetch(`${BASE}/charts/intraday`, {
+      }, false),
+      dhanFetch(`${BASE}/charts/intraday`, {
         method: 'POST',
         headers: HEADERS(),
         body: JSON.stringify({
@@ -235,7 +170,7 @@ app.get('/api/live', async (req, res) => {
           fromDate: new Date(Date.now() - 4 * 60 * 60 * 1000).toISOString().slice(0, 19).replace('T', ' '),
           toDate: new Date().toISOString().slice(0, 19).replace('T', ' ')
         })
-      })
+      }, false)
     ]);
     const ohlc = await ohlcRes.json();
     const candles = await candleRes.json();
@@ -245,11 +180,13 @@ app.get('/api/live', async (req, res) => {
   }
 });
 
-// Places entry + stop-loss together as a Dhan Super Order (Cover Order —
-// no target leg). If your entry fills, Dhan holds the stop-loss on the
-// exchange automatically; you don't have to watch and exit it by hand.
+// The one call that needs the static IP — routed through the proxy when
+// PROXY_URL is configured.
 app.post('/api/order', async (req, res) => {
   try {
+    if (!proxyAgent) {
+      return res.status(400).json({ error: 'PROXY_URL is not set yet — order placement needs your static IP proxy configured first. Quotes and charts work fine without it.' });
+    }
     const { index, expiry, strike, type, transactionType, quantity, price, stopLossPrice } = req.body;
     if (!index || !expiry || !strike || !type || !quantity || !price || !stopLossPrice) {
       return res.status(400).json({ error: 'index, expiry, strike, type, quantity, price, stopLossPrice are required' });
@@ -258,6 +195,34 @@ app.post('/api/order', async (req, res) => {
 
     const orderPayload = {
       dhanClientId: process.env.DHAN_CLIENT_ID,
+      correlationId: `st-${Date.now()}`,
+      transactionType: transactionType || 'BUY',
+      exchangeSegment: exchange,
+      productType: 'CO',
+      orderType: 'LIMIT',
+      securityId: String(securityId),
+      quantity: Number(quantity),
+      price: Number(price),
+      stopLossPrice: Number(stopLossPrice)
+    };
+
+    const r = await dhanFetch(`${BASE}/super/orders`, {
+      method: 'POST',
+      headers: HEADERS(),
+      body: JSON.stringify(orderPayload)
+    }, true); // <-- routed through the static IP proxy
+    const data = await r.json();
+    res.status(r.status).json(data);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/health', (req, res) => res.json({ ok: true, proxyConfigured: !!proxyAgent }));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Strike Terminal backend listening on ${PORT} (proxy: ${proxyAgent ? 'configured' : 'not set'})`));
+AN_CLIENT_ID,
       correlationId: `st-${Date.now()}`,
       transactionType: transactionType || 'BUY',
       exchangeSegment: exchange,
