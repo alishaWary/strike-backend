@@ -77,6 +77,79 @@ async function loadFilteredInstruments(indexName) {
 
   let cols = null;
   const rows = [];
+/**
+ * Strike Terminal — Dhan order/data proxy
+ * ----------------------------------------
+ * Sits between your phone UI and Dhan's v2 API. Holds your access token
+ * and (once you buy it) the whitelisted static IP that Dhan requires for
+ * order placement. Never ship DHAN_ACCESS_TOKEN to the browser.
+ *
+ * Endpoints:
+ *   GET  /api/expiries?index=NIFTY|SENSEX
+ *   GET  /api/live?index=NIFTY&expiry=2026-09-30&strike=24850&type=CE
+ *   POST /api/order   { index, expiry, strike, type, transactionType, quantity, price, stopLossPrice }
+ *
+ * /api/order places a Dhan Super Order with productType "CO" (Cover
+ * Order) — this bundles your entry with a real stop-loss leg placed on the
+ * exchange, instead of a plain single order with no protection. No target
+ * leg is sent, matching "entry + stop-loss only."
+ *
+ * Env vars (set these in Render/Railway's dashboard, not in code):
+ *   DHAN_CLIENT_ID
+ *   DHAN_ACCESS_TOKEN
+ *   ALLOWED_ORIGIN     (optional — restrict CORS to your frontend's URL)
+ */
+
+const express = require('express');
+const cors = require('cors');
+const { parse } = require('csv-parse');
+const { Readable } = require('stream');
+
+const app = express();
+app.use(express.json());
+app.use(cors({ origin: process.env.ALLOWED_ORIGIN || '*' }));
+
+const BASE = 'https://api.dhan.co/v2';
+const HEADERS = () => ({
+  'Content-Type': 'application/json',
+  'Accept': 'application/json',
+  'access-token': process.env.DHAN_ACCESS_TOKEN,
+  'client-id': process.env.DHAN_CLIENT_ID
+});
+
+const UNDERLYING = {
+  NIFTY:  { securityId: 13, segment: 'IDX_I', exchange: 'NSE_FNO' },
+  SENSEX: { securityId: 51, segment: 'IDX_I', exchange: 'BSE_FNO' }
+};
+
+const filteredCache = {};
+
+function findCol(row, ...hints) {
+  const keys = Object.keys(row);
+  for (const hint of hints) {
+    const hit = keys.find(k => k.toUpperCase().includes(hint));
+    if (hit) return hit;
+  }
+  return null;
+}
+
+async function loadFilteredInstruments(indexName) {
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+  const cached = filteredCache[indexName];
+  if (cached && Date.now() - cached.fetchedAt < ONE_DAY) return cached;
+
+  const underlying = UNDERLYING[indexName];
+  const res = await fetch(`${BASE}/instrument/${underlying.exchange}`, {
+    headers: { 'access-token': process.env.DHAN_ACCESS_TOKEN }
+  });
+  if (!res.ok) throw new Error(`Instrument list fetch failed for ${underlying.exchange}: ${res.status}`);
+  if (!res.body) throw new Error('No response body from Dhan instrument endpoint');
+
+  const nodeStream = Readable.fromWeb(res.body);
+  const parser = nodeStream.pipe(parse({ columns: true, skip_empty_lines: true }));
+
+  let cols = null;
+  const rows = [];
 
   for await (const record of parser) {
     if (!cols) {
@@ -91,7 +164,6 @@ async function loadFilteredInstruments(indexName) {
         throw new Error(`Could not identify instrument CSV columns for ${underlying.exchange} — check raw headers and adjust findCol() hints`);
       }
     }
-    // Keep only rows for this index — this is what keeps memory small.
     if (String(record[cols.sym]).toUpperCase().includes(indexName)) {
       rows.push(record);
     }
@@ -173,11 +245,14 @@ app.get('/api/live', async (req, res) => {
   }
 });
 
+// Places entry + stop-loss together as a Dhan Super Order (Cover Order —
+// no target leg). If your entry fills, Dhan holds the stop-loss on the
+// exchange automatically; you don't have to watch and exit it by hand.
 app.post('/api/order', async (req, res) => {
   try {
-    const { index, expiry, strike, type, transactionType, quantity, orderType, price, triggerPrice } = req.body;
-    if (!index || !expiry || !strike || !type || !quantity) {
-      return res.status(400).json({ error: 'index, expiry, strike, type, quantity are required' });
+    const { index, expiry, strike, type, transactionType, quantity, price, stopLossPrice } = req.body;
+    if (!index || !expiry || !strike || !type || !quantity || !price || !stopLossPrice) {
+      return res.status(400).json({ error: 'index, expiry, strike, type, quantity, price, stopLossPrice are required' });
     }
     const { securityId, exchange } = await resolveSecurityId(index, expiry, strike, type);
 
@@ -186,16 +261,15 @@ app.post('/api/order', async (req, res) => {
       correlationId: `st-${Date.now()}`,
       transactionType: transactionType || 'BUY',
       exchangeSegment: exchange,
-      productType: 'INTRADAY',
-      orderType: orderType || 'MARKET',
-      validity: 'DAY',
+      productType: 'CO',
+      orderType: 'LIMIT',
       securityId: String(securityId),
-      quantity: String(quantity),
-      price: price ? String(price) : '',
-      triggerPrice: triggerPrice ? String(triggerPrice) : ''
+      quantity: Number(quantity),
+      price: Number(price),
+      stopLossPrice: Number(stopLossPrice)
     };
 
-    const r = await fetch(`${BASE}/orders`, {
+    const r = await fetch(`${BASE}/super/orders`, {
       method: 'POST',
       headers: HEADERS(),
       body: JSON.stringify(orderPayload)
@@ -211,3 +285,4 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Strike Terminal backend listening on ${PORT}`));
+
