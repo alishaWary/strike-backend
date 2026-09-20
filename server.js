@@ -14,11 +14,18 @@
  *   DHAN_CLIENT_ID
  *   DHAN_ACCESS_TOKEN
  *   ALLOWED_ORIGIN     (optional — restrict CORS to your frontend's URL)
+ *
+ * Memory note: Dhan's /instrument/{exchange} endpoint returns EVERY listed
+ * contract on that exchange (tens of thousands of rows) — too big to hold
+ * fully in memory on a small server. loadFilteredInstruments() streams the
+ * CSV and keeps only rows for the index you asked about, instead of
+ * parsing/storing the whole file.
  */
 
 const express = require('express');
 const cors = require('cors');
-const { parse } = require('csv-parse/sync');
+const { parse } = require('csv-parse');
+const { Readable } = require('stream');
 
 const app = express();
 app.use(express.json());
@@ -33,33 +40,17 @@ const HEADERS = () => ({
 });
 
 // NIFTY trades options on NSE, SENSEX trades options on BSE — different
-// exchange segments, different instrument lists. Each index also has its
-// own IDX_I security ID for option-chain/expiry lookups.
+// exchange segments, different instrument lists.
 const UNDERLYING = {
   NIFTY:  { securityId: 13, segment: 'IDX_I', exchange: 'NSE_FNO' },
   SENSEX: { securityId: 51, segment: 'IDX_I', exchange: 'BSE_FNO' }
 };
 
-// ---- Instrument master cache, kept separately per exchange (NSE_FNO / BSE_FNO) ----
-const instrumentCache = {}; // { NSE_FNO: {rows, fetchedAt}, BSE_FNO: {...} }
+// Cache is keyed per INDEX (not per whole exchange) and holds only the
+// handful of rows that matched — a few hundred KB at most, not the
+// multi-thousand-row full exchange file.
+const filteredCache = {}; // { NIFTY: {rows, cols, fetchedAt}, SENSEX: {...} }
 
-async function loadInstruments(exchange) {
-  const ONE_DAY = 24 * 60 * 60 * 1000;
-  const cached = instrumentCache[exchange];
-  if (cached && Date.now() - cached.fetchedAt < ONE_DAY) return cached.rows;
-
-  const res = await fetch(`${BASE}/instrument/${exchange}`, {
-    headers: { 'access-token': process.env.DHAN_ACCESS_TOKEN }
-  });
-  if (!res.ok) throw new Error(`Instrument list fetch failed for ${exchange}: ${res.status}`);
-  const csvText = await res.text();
-  const rows = parse(csvText, { columns: true, skip_empty_lines: true });
-  instrumentCache[exchange] = { rows, fetchedAt: Date.now() };
-  return rows;
-}
-
-// Column names in Dhan's instrument CSV have varied across exports, so match
-// loosely by intent instead of hardcoding exact headers.
 function findCol(row, ...hints) {
   const keys = Object.keys(row);
   for (const hint of hints) {
@@ -69,34 +60,64 @@ function findCol(row, ...hints) {
   return null;
 }
 
-async function resolveSecurityId(index, expiry, strike, type) {
-  const underlying = UNDERLYING[index.toUpperCase()];
-  if (!underlying) throw new Error(`Unknown index ${index}`);
-  const rows = await loadInstruments(underlying.exchange);
-  if (!rows.length) throw new Error(`Instrument list empty for ${underlying.exchange}`);
+async function loadFilteredInstruments(indexName) {
+  const ONE_DAY = 24 * 60 * 60 * 1000;
+  const cached = filteredCache[indexName];
+  if (cached && Date.now() - cached.fetchedAt < ONE_DAY) return cached;
 
-  const sample = rows[0];
-  const symCol = findCol(sample, 'UNDERLYING_SYMBOL', 'SYMBOL_NAME', 'SEM_TRADING_SYMBOL');
-  const strikeCol = findCol(sample, 'STRIKE');
-  const expiryCol = findCol(sample, 'EXPIRY');
-  const optTypeCol = findCol(sample, 'OPTION_TYPE', 'OPT_TYPE');
-  const idCol = findCol(sample, 'SECURITY_ID');
-  if (!symCol || !strikeCol || !expiryCol || !optTypeCol || !idCol) {
-    throw new Error(`Could not identify instrument CSV columns for ${underlying.exchange} — inspect the raw CSV headers and adjust findCol() hints`);
+  const underlying = UNDERLYING[indexName];
+  const res = await fetch(`${BASE}/instrument/${underlying.exchange}`, {
+    headers: { 'access-token': process.env.DHAN_ACCESS_TOKEN }
+  });
+  if (!res.ok) throw new Error(`Instrument list fetch failed for ${underlying.exchange}: ${res.status}`);
+  if (!res.body) throw new Error('No response body from Dhan instrument endpoint');
+
+  const nodeStream = Readable.fromWeb(res.body);
+  const parser = nodeStream.pipe(parse({ columns: true, skip_empty_lines: true }));
+
+  let cols = null;
+  const rows = [];
+
+  for await (const record of parser) {
+    if (!cols) {
+      cols = {
+        sym: findCol(record, 'UNDERLYING_SYMBOL', 'SYMBOL_NAME', 'SEM_TRADING_SYMBOL'),
+        strike: findCol(record, 'STRIKE'),
+        expiry: findCol(record, 'EXPIRY'),
+        optType: findCol(record, 'OPTION_TYPE', 'OPT_TYPE'),
+        id: findCol(record, 'SECURITY_ID')
+      };
+      if (!cols.sym || !cols.strike || !cols.expiry || !cols.optType || !cols.id) {
+        throw new Error(`Could not identify instrument CSV columns for ${underlying.exchange} — check raw headers and adjust findCol() hints`);
+      }
+    }
+    // Keep only rows for this index — this is what keeps memory small.
+    if (String(record[cols.sym]).toUpperCase().includes(indexName)) {
+      rows.push(record);
+    }
   }
 
-  const wantSymbol = index.toUpperCase();
+  const entry = { rows, cols, fetchedAt: Date.now(), exchange: underlying.exchange };
+  filteredCache[indexName] = entry;
+  return entry;
+}
+
+async function resolveSecurityId(index, expiry, strike, type) {
+  const indexName = index.toUpperCase();
+  if (!UNDERLYING[indexName]) throw new Error(`Unknown index ${index}`);
+  const { rows, cols, exchange } = await loadFilteredInstruments(indexName);
+  if (!rows.length) throw new Error(`No ${indexName} contracts found on ${exchange} — instrument list may be empty`);
+
   const wantStrike = String(strike);
   const wantType = type.toUpperCase().startsWith('C') ? 'CE' : 'PE';
 
   const match = rows.find(r =>
-    String(r[symCol]).toUpperCase().includes(wantSymbol) &&
-    String(r[expiryCol]).startsWith(expiry) &&
-    String(parseFloat(r[strikeCol])) === String(parseFloat(wantStrike)) &&
-    String(r[optTypeCol]).toUpperCase().startsWith(wantType[0])
+    String(r[cols.expiry]).startsWith(expiry) &&
+    String(parseFloat(r[cols.strike])) === String(parseFloat(wantStrike)) &&
+    String(r[cols.optType]).toUpperCase().startsWith(wantType[0])
   );
-  if (!match) throw new Error(`No contract found for ${index} ${expiry} ${strike}${wantType} on ${underlying.exchange}`);
-  return { securityId: match[idCol], exchange: underlying.exchange };
+  if (!match) throw new Error(`No contract found for ${index} ${expiry} ${strike}${wantType} on ${exchange}`);
+  return { securityId: match[cols.id], exchange };
 }
 
 // ---- Routes ----
